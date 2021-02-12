@@ -27,6 +27,7 @@ mod zcstream;
 #[cfg(feature = "zcstream")]
 mod zlibstream;
 
+use io::Result;
 pub use stream::Stream;
 #[cfg(feature = "zcstream")]
 pub use zlibstream::ZlibStream;
@@ -40,8 +41,9 @@ use std::io;
 use std::io::{Read, Write, ErrorKind};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
+use std::rc::Rc;
+use std::ops::{Deref, DerefMut};
 
-use event::TelnetEventQueue;
 use byte::*;
 
 #[cfg(feature = "zcstream")]
@@ -50,14 +52,12 @@ type TStream = zcstream::ZCStream;
 type TStream = stream::Stream;
 
 #[derive(Debug)]
-enum ProcessState {
-    NormalData,
+enum ParsingState {
+    NormalData(usize),
     IAC,
     SB,
-    SBData(TelnetOption, usize),    // (option, start location of option data)
-    SBDataIAC(TelnetOption, usize), // (option, start location of option data)
-    Will, Wont,
-    Do, Dont
+    SBData(TelnetOption, Vec<u8>, bool),    // option, data, iac
+    Negotiation(NegotiationAction),
 }
 
 ///
@@ -75,51 +75,19 @@ enum ProcessState {
 /// }
 /// ```
 ///
-pub struct Telnet {
-    stream: Box<TStream>,
-    event_queue: TelnetEventQueue,
-
-    // Buffer
-    buffer: Box<[u8]>,
-    buffered_size: usize,
-    process_buffer: Box<[u8]>,
-    process_buffered_size: usize
+pub struct Parser {
+    state: ParsingState,
 }
 
-impl Telnet {
-
-    ///
-    /// Opens a telnet connection to a remote host using a `TcpStream`.
-    ///
-    /// `addr` is an address of the remote host. Note that a remote host usually opens port 23 for
-    /// a Telnet connection. `buf_size` is a size of the underlying buffer for processing the data
-    ///  read from the remote host.
-    ///
-    /// # Examples
-    /// ```rust,should_panic
-    /// use telnet::Telnet;
-    ///
-    /// let connection = Telnet::connect(("127.0.0.1", 23), 256)
-    ///         .expect("Couldn't connect to the server...");
-    /// ```
-    ///
-    pub fn connect<A: ToSocketAddrs>(addr: A, buf_size: usize) -> io::Result<Telnet> {
-        let stream = TcpStream::connect(addr)?; // send the error out directly
-
-        #[cfg(feature = "zcstream")]
-        return Ok(Telnet::from_stream(Box::new(ZlibStream::from_stream(stream)), buf_size));
-        #[cfg(not(feature = "zcstream"))]
-        return Ok(Telnet::from_stream(Box::new(stream), buf_size));
-    }
-
+impl Parser {
     #[cfg(feature = "zcstream")]
     pub fn begin_zlib(&mut self) {
-        self.stream.begin_zlib()
+        //self.stream.begin_zlib()
     }
 
     #[cfg(feature = "zcstream")]
     pub fn end_zlib(&mut self) {
-        self.stream.end_zlib()
+        //self.stream.end_zlib()
     }
     /// Open a telnet connection to a remote host using a generic stream.
     /// 
@@ -128,16 +96,9 @@ impl Telnet {
     /// 
     /// Use this version of the constructor if you want to provide your own stream, for example if you want
     /// to mock out the remote host for testing purposes, or want to wrap the data the data with TLS encryption.
-    pub fn from_stream(stream: Box<TStream>, buf_size: usize) -> Telnet {
-        let actual_size = if buf_size == 0 { 1 } else { buf_size };
-
-        Telnet {
-            stream: stream,
-            event_queue: TelnetEventQueue::new(),
-            buffer: vec![0; actual_size].into_boxed_slice(),
-            buffered_size: 0,
-            process_buffer: vec![0; actual_size].into_boxed_slice(),
-            process_buffered_size: 0
+    pub fn new() -> Parser {
+        Parser {
+            state: ParsingState::NormalData(0),
         }
     }
 
@@ -158,392 +119,298 @@ impl Telnet {
     /// println!("{:?}", event);
     /// ```
     ///
-    pub fn read(&mut self) -> io::Result<TelnetEvent> {
-        while self.event_queue.is_empty() {
-            // Set stream settings
-            self.stream.set_nonblocking(false).expect("set_nonblocking call failed");
-            self.stream.set_read_timeout(None).expect("set_read_timeout call failed");
-
-            // Read bytes to the buffer
-            match self.stream.read(&mut self.buffer) {
-                Ok(size) => {
-                    self.buffered_size = size;
-                },
-                Err(e) => return Err(e)
-            }
-
-            self.process();
+    pub fn parse<'a>(&mut self, buffer: &'a [u8]) -> Events<'a> {
+        if let ParsingState::NormalData(data_start) = self.state {
+            assert!(data_start == 0);
         }
 
-        // Return an event
-        Ok(
-            match self.event_queue.take_event() {
-                Some(x) => x,
-                None => TelnetEvent::Error("Internal Queue error".to_string())
+        let mut events: Vec<TelnetEvent> = (0..buffer.len())
+            .filter_map(|i| self.parse_byte(buffer, i))
+            .collect();
+
+        if let ParsingState::NormalData(data_start) = self.state {
+            if data_start < buffer.len() {
+                events.push(TelnetEvent::Data(&buffer[data_start..]));
             }
-        )
+
+            // Reset for next call to read
+            self.state = ParsingState::NormalData(0);
+        }
+
+        events.into()
     }
 
-    ///
-    /// Reads a `TelnetEvent`, but the waiting time cannot exceed a given `Duration`.
-    ///
-    /// This method is similar to `read()`, but with a time limitation. If the given time was
-    /// reached, it would return `TelnetEvent::TimedOut`.
-    ///
-    /// # Examples
-    /// ```rust,should_panic
-    /// use std::time::Duration;
-    /// use telnet::Telnet;
-    ///
-    /// let mut connection = Telnet::connect(("127.0.0.1", 23), 256)
-    ///         .expect("Couldn't connect to the server...");
-    /// let event = connection.read_timeout(Duration::new(5, 0)).expect("Read Error");
-    /// println!("{:?}", event);
-    /// ```
-    ///
-    pub fn read_timeout(&mut self, timeout: Duration) -> io::Result<TelnetEvent> {
-        if self.event_queue.is_empty() {
-            // Set stream settings
-            self.stream.set_nonblocking(false).expect("set_nonblocking call failed");
-            self.stream.set_read_timeout(Some(timeout)).expect("set_read_timeout call failed");
+    fn parse_byte<'a>(&mut self, buffer: &'a [u8], index: usize) -> Option<TelnetEvent<'a>> {
+        let byte = buffer[index];
 
-            // Read bytes to the buffer
-            match self.stream.read(&mut self.buffer) {
-                Ok(size) => {
-                    self.buffered_size = size;
-                },
-                Err(e) => {
-                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut {
-                        return Ok(TelnetEvent::TimedOut);
-                    } else {
-                        return Err(e);
+        match self.state {
+            // Normal Data
+            ParsingState::NormalData(data_start) => {
+                if byte == BYTE_IAC {
+                    // The following bytes will be commands
+
+                    // Update the state
+                    self.state = ParsingState::IAC;
+
+                    // Send the data before this byte
+                    if data_start < index {
+                        return Some(TelnetEvent::Data(&buffer[data_start..index]));
                     }
                 }
-            }
+            },
 
-            self.process();
-        }
+            // Telnet Commands
+            ParsingState::IAC => {
+                let mut err = false;
 
-        // Return an event
-        Ok(
-            match self.event_queue.take_event() {
-                Some(x) => x,
-                None => TelnetEvent::Error("Internal Queue error".to_string())
-            }
-        )
-    }
-
-    ///
-    /// Reads a `TelnetEvent`. Return immediataly if there was no queued event and nothing to read.
-    ///
-    /// This method is a non-blocking version of `read()`. If there was no more data, it would
-    /// return `TelnetEvent::NoData`.
-    ///
-    /// # Examples
-    /// ```rust,should_panic
-    /// use telnet::Telnet;
-    ///
-    /// let mut connection = Telnet::connect(("127.0.0.1", 23), 256)
-    ///         .expect("Couldn't connect to the server...");
-    /// let event = connection.read_nonblocking().expect("Read Error");
-    /// println!("{:?}", event);
-    /// ```
-    ///
-    pub fn read_nonblocking(&mut self) -> io::Result<TelnetEvent> {
-        if self.event_queue.is_empty() {
-            // Set stream settings
-            self.stream.set_nonblocking(true).expect("set_nonblocking call failed");
-            self.stream.set_read_timeout(None).expect("set_read_timeout call failed");
-
-            // Read bytes to the buffer
-            match self.stream.read(&mut self.buffer) {
-                Ok(size) => {
-                    self.buffered_size = size;
-                },
-                Err(e) => {
-                    if e.kind() == ErrorKind::WouldBlock {
-                        return Ok(TelnetEvent::NoData);
-                    } else {
-                        return Err(e);
+                self.state = match byte {
+                    // Negotiation Commands
+                    BYTE_WILL => ParsingState::Negotiation(NegotiationAction::Will),
+                    BYTE_WONT => ParsingState::Negotiation(NegotiationAction::Wont),
+                    BYTE_DO => ParsingState::Negotiation(NegotiationAction::Do),
+                    BYTE_DONT => ParsingState::Negotiation(NegotiationAction::Dont),
+                    // Subnegotiation
+                    BYTE_SB => ParsingState::SB,
+                    // Escaping
+                    // TODO: Write a test case for this
+                    BYTE_IAC => ParsingState::NormalData(index),
+                    // Unknown IAC commands
+                    _ => {
+                        err = true;
+                        ParsingState::NormalData(index+1)
                     }
+                };
+
+                if err {
+                    return Some(TelnetEvent::UnknownIAC(byte));
                 }
-            }
+            },
 
-            self.process();
-        }
+            // Negotiation
+            ParsingState::Negotiation(action) => {
+                self.state = ParsingState::NormalData(index+1);
+                let opt = TelnetOption::parse(byte);
+                return Some(TelnetEvent::Negotiation(action, opt));
+            },
 
-        // Return an event
-        Ok(
-            match self.event_queue.take_event() {
-                Some(x) => x,
-                None => TelnetEvent::Error("Internal Queue error".to_string())
-            }
-        )
+            // Start subnegotiation
+            ParsingState::SB => {
+                let opt = TelnetOption::parse(byte);
+                self.state = ParsingState::SBData(opt, Vec::new(), false);
+            },
 
-    }
+            // Subnegotiation's data
+            ParsingState::SBData(opt, ref mut data, ref mut iac) => {
+                if *iac {
+                    // IAC inside Subnegotiation's data
+                    *iac = false;
 
-    ///
-    /// Writes a given data block to the remote host. It will double any IAC byte.
-    ///
-    /// # Examples
-    /// ```rust,should_panic
-    /// use telnet::Telnet;
-    ///
-    /// let mut connection = Telnet::connect(("127.0.0.1", 23), 256)
-    ///         .expect("Couldn't connect to the server...");
-    /// let buffer: [u8; 4] = [83, 76, 77, 84];
-    /// connection.write(&buffer).expect("Write Error");
-    /// ```
-    ///
-    pub fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        let mut write_size = 0;
-
-        let mut start = 0;
-        for i in 0..data.len() {
-            if data[i] == BYTE_IAC {
-                self.stream.write(&data[start .. i + 1])?;
-                self.stream.write(&[BYTE_IAC])?;
-                write_size = write_size + (i + 1 - start);
-                start = i + 1;
-            }
-        }
-
-        if start < data.len() {
-            self.stream.write(&data[start .. data.len()])?;
-            write_size = write_size + (data.len() - start);
-        }
-
-        Ok(write_size)
-    }
-
-    ///
-    /// Negotiates a telnet option with the remote host.
-    ///
-    /// # Examples
-    /// ```rust,should_panic
-    /// use telnet::{Telnet, NegotiationAction, TelnetOption};
-    ///
-    /// let mut connection = Telnet::connect(("127.0.0.1", 23), 256)
-    ///         .expect("Couldn't connect to the server...");
-    /// connection.negotiate(NegotiationAction::Will, TelnetOption::Echo);
-    /// ```
-    ///
-    pub fn negotiate(&mut self, action: NegotiationAction, opt: TelnetOption) {
-        let buf: &[u8] = &[BYTE_IAC, action.to_byte(), opt.to_byte()];
-        self.stream.write(buf).expect("Error sending negotiation");
-    }
-
-    ///
-    /// Send data for sub-negotiation with the remote host.
-    ///
-    /// # Examples
-    /// ```rust,should_panic
-    /// use telnet::{Telnet, NegotiationAction, TelnetOption};
-    ///
-    /// let mut connection = Telnet::connect(("127.0.0.1", 23), 256)
-    ///         .expect("Couldn't connect to the server...");
-    /// connection.negotiate(NegotiationAction::Do, TelnetOption::TTYPE);
-    /// let data: [u8; 1] = [1];
-    /// connection.subnegotiate(TelnetOption::TTYPE, &data);
-    /// ```
-    ///
-    pub fn subnegotiate(&mut self, opt: TelnetOption, data: &[u8]) {
-        let buf: &[u8] = &[BYTE_IAC, BYTE_SB, opt.to_byte()];
-        self.stream.write(buf).expect("Error sending subnegotiation (START)");
-
-        self.stream.write(data).expect("Error sending subnegotiation (DATA)");
-
-        let buf: &[u8] = &[BYTE_IAC, BYTE_SE];
-        self.stream.write(buf).expect("Error sending subnegotiation (END)");
-    }
-
-    fn process(&mut self) {
-        let mut current = 0;
-        let mut state = ProcessState::NormalData;
-        let mut data_start = 0;
-
-        while current < self.buffered_size {
-            // Gather a byte
-            let byte = self.buffer[current];
-
-            // Process the byte
-            match state {
-                // Normal Data
-                ProcessState::NormalData => {
-                    if byte == BYTE_IAC {
-                        // The following bytes will be commands
-
-                        // Update the state
-                        state = ProcessState::IAC;
-
-                        // Send the data before this byte
-                        if current > data_start {
-                            let data_end = current;
-                            let data = self.copy_buffered_data(data_start, data_end);
-                            self.event_queue.push_event(TelnetEvent::Data(data));
-
-                            // Update the state
-                            data_start = current;
-                        }
-                    } else if current == self.buffered_size - 1 {
-                        // It reaches the end of the buffer
-                        let data_end = self.buffered_size;
-                        let data = self.copy_buffered_data(data_start, data_end);
-                        self.event_queue.push_event(TelnetEvent::Data(data));
-                    }
-                },
-
-                // Telnet Commands
-                ProcessState::IAC => {
-                    match byte {
-                        // Negotiation Commands
-                        BYTE_WILL => state = ProcessState::Will,
-                        BYTE_WONT => state = ProcessState::Wont,
-                        BYTE_DO => state = ProcessState::Do,
-                        BYTE_DONT => state = ProcessState::Dont,
-                        // Subnegotiation
-                        BYTE_SB => state = ProcessState::SB,
-                        // Escaping
-                        // TODO: Write a test case for this
-                        BYTE_IAC => {
-                            // Copy the data to the process buffer
-                            self.append_data_to_proc_buffer(data_start, current - 1);
-
-                            // Add escaped IAC
-                            self.process_buffer[self.process_buffered_size] = BYTE_IAC;
-                            self.process_buffered_size += 1;
-
-                            // Update the state
-                            state = ProcessState::NormalData;
-                            data_start = current + 1;
-                        },
-                        // Unknown IAC commands
-                        _ => {
-                            state = ProcessState::NormalData;
-                            data_start = current + 1;
-                            self.event_queue.push_event(TelnetEvent::UnknownIAC(byte));
-                        }
-                    }
-                },
-
-                // Negotiation
-                ProcessState::Will | ProcessState::Wont |
-                        ProcessState::Do | ProcessState::Dont => {
-
-                    let opt = TelnetOption::parse(byte);
-
-                    match state {
-                        ProcessState::Will => {
-                            self.event_queue.push_event(
-                                TelnetEvent::Negotiation(NegotiationAction::Will, opt));
-                        },
-                        ProcessState::Wont => {
-                            self.event_queue.push_event(
-                                TelnetEvent::Negotiation(NegotiationAction::Wont, opt));
-                        },
-                        ProcessState::Do => {
-                            self.event_queue.push_event(
-                                TelnetEvent::Negotiation(NegotiationAction::Do, opt));
-                        },
-                        ProcessState::Dont => {
-                            self.event_queue.push_event(
-                                TelnetEvent::Negotiation(NegotiationAction::Dont, opt));
-                        },
-                        _ => {} // Do nothing
-                    }
-
-                    state = ProcessState::NormalData;
-                    data_start = current + 1;
-                },
-
-                // Start subnegotiation
-                ProcessState::SB => {
-                    let opt = TelnetOption::parse(byte);
-                    state = ProcessState::SBData(opt, current + 1);
-                },
-
-                // Subnegotiation's data
-                ProcessState::SBData(opt, data_start) => {
-                    if byte == BYTE_IAC {
-                        state = ProcessState::SBDataIAC(opt, data_start);
-                    }
-
-                    // XXX: We may need to consider the case that a SB Data
-                    // sequence may exceed this buffer
-                },
-
-                // IAC inside Subnegotiation's data
-                ProcessState::SBDataIAC(opt, sb_data_start) => {
                     match byte {
                         // The end of subnegotiation
                         BYTE_SE => {
-                            // Update state
-                            state = ProcessState::NormalData;
-                            data_start = current + 1;
-
-                            // Return the option
-                            let sb_data_end = current - 1;
-                            let data = self.copy_buffered_data(sb_data_start, sb_data_end);
-                            self.event_queue.push_event(TelnetEvent::Subnegotiation(opt, data));
+                            let data_boxed = data.clone().into();
+                            self.state = ParsingState::NormalData(index+1);
+                            return Some(TelnetEvent::Subnegotiation(opt, data_boxed));
                         },
                         // Escaping
                         // TODO: Write a test case for this
-                        BYTE_IAC => {
-                            // Copy the data to the process buffer
-                            self.append_data_to_proc_buffer(sb_data_start, current - 1);
-
-                            // Add escaped IAC
-                            self.process_buffer[self.process_buffered_size] = BYTE_IAC;
-                            self.process_buffered_size += 1;
-
-                            // Update the state
-                            state = ProcessState::SBData(opt, current + 1);
-                        },
+                        BYTE_IAC => data.push(BYTE_IAC),
                         // TODO: Write a test case for this
-                        b => {
-                            self.event_queue.push_event(TelnetEvent::Error(
-                                format!("Unexpected byte after IAC inside SB: {}", b)));
-
-                            // Copy the data to the process buffer
-                            self.append_data_to_proc_buffer(sb_data_start, current - 1);
-                            // Update the state
-                            state = ProcessState::SBData(opt, current + 1);
-                        }
+                        b => return Some(TelnetEvent::Error(format!("Unexpected byte after IAC inside SB: {}", b))),
+                    }
+                } else {
+                    if byte == BYTE_IAC {
+                        *iac = true;
+                    } else {
+                        data.push(byte);
                     }
                 }
-            }
+            },
+        }
 
-            // Move to the next byte
-            current += 1;
+        None
+    }
+}
+
+fn format_internal(mut buffer: Vec<u8>, data: &[u8]) -> Vec<u8> {
+    let mut start = 0;
+
+    for i in 0..data.len() {
+        if data[i] == BYTE_IAC {
+            buffer.extend_from_slice(&data[start..(i+1)]);
+            start = i;
         }
     }
 
-    // Copy the data to the process buffer
-    fn append_data_to_proc_buffer(&mut self, data_start: usize, data_end: usize) {
-        let data_length = data_end - data_start;
-        let dst_start = self.process_buffered_size;
-        let dst_end = self.process_buffered_size + data_length;
-        let dst = &mut self.process_buffer[dst_start .. dst_end];
-        dst.copy_from_slice(&self.buffer[data_start .. data_end]);
-        self.process_buffered_size += data_length;
+    if start < data.len() {
+        buffer.extend_from_slice(&data[start..]);
     }
 
-    fn copy_buffered_data(&mut self, data_start: usize, data_end: usize) -> Box<[u8]> {
-        let data = if self.process_buffered_size > 0 {
-            // Copy the data to the process buffer
-            self.append_data_to_proc_buffer(data_start, data_end);
+    buffer
+}
 
-            let pbe = self.process_buffered_size;
-            self.process_buffered_size = 0;
+///
+/// Writes a given data block to the remote host. It will double any IAC byte.
+///
+/// # Examples
+/// ```rust,should_panic
+/// use telnet::Telnet;
+///
+/// let mut connection = Telnet::connect(("127.0.0.1", 23), 256)
+///         .expect("Couldn't connect to the server...");
+/// let buffer: [u8; 4] = [83, 76, 77, 84];
+/// connection.write(&buffer).expect("Write Error");
+/// ```
+///
+pub fn format(data: &[u8]) -> Box<[u8]> {
+    format_internal(Vec::new(), data).into()
+}
 
-            &self.process_buffer[0 .. pbe]
-        } else {
-            &self.buffer[data_start .. data_end]
-        };
+///
+/// Negotiates a telnet option with the remote host.
+///
+/// # Examples
+/// ```rust,should_panic
+/// use telnet::{Telnet, NegotiationAction, TelnetOption};
+///
+/// let mut connection = Telnet::connect(("127.0.0.1", 23), 256)
+///         .expect("Couldn't connect to the server...");
+/// connection.negotiate(NegotiationAction::Will, TelnetOption::Echo);
+/// ```
+///
+pub fn format_negotiate(action: NegotiationAction, opt: TelnetOption) -> Box<[u8]> {
+    Box::new([BYTE_IAC, action.to_byte(), opt.to_byte()])
+}
 
-        Box::from(data)
+///
+/// Send data for sub-negotiation with the remote host.
+///
+/// # Examples
+/// ```rust,should_panic
+/// use telnet::{Telnet, NegotiationAction, TelnetOption};
+///
+/// let mut connection = Telnet::connect(("127.0.0.1", 23), 256)
+///         .expect("Couldn't connect to the server...");
+/// connection.negotiate(NegotiationAction::Do, TelnetOption::TTYPE);
+/// let data: [u8; 1] = [1];
+/// connection.subnegotiate(TelnetOption::TTYPE, &data);
+/// ```
+///
+pub fn format_subnegotiate(opt: TelnetOption, data: &[u8]) -> Box<[u8]> {
+    let mut buf = format_internal(vec![BYTE_IAC, BYTE_SB, opt.to_byte()], data);
+    buf.extend_from_slice(&[BYTE_IAC, BYTE_SE]);
+    buf.into()
+}
+
+pub struct Events<'a> {
+    inner: std::vec::IntoIter<TelnetEvent<'a>>,
+}
+
+impl<'a> From<Vec<TelnetEvent<'a>>> for Events<'a> {
+    fn from(events: Vec<TelnetEvent<'a>>) -> Self {
+        Self { inner: events.into_iter() }
     }
 }
+
+impl<'a> Iterator for Events<'a> {
+    type Item = TelnetEvent<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+pub struct Reader<R: Read> {
+    parser: Parser,
+    reader: R,
+    buffer: Box<[u8]>,
+}
+
+impl<R: Read> Reader<R> {
+    pub fn new(reader: R, capacity: usize) -> Self {
+        Self {
+            parser: Parser::new(),
+            reader,
+            buffer: vec![0; capacity].into(),
+        }
+    }
+
+    pub fn read(&mut self) -> io::Result<Events> {
+        let n = self.reader.read(self.buffer.as_mut())?;
+        Ok(self.parser.parse(&self.buffer[..n]))
+    }
+}
+
+pub struct Writer<W: Write> {
+    writer: W,
+    iac: bool,
+}
+
+impl<W: Write> Write for Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.iac {
+            if self.writer.write(&[BYTE_IAC])? > 0 {
+                self.iac = false;
+            }
+            return Ok(0);
+        }
+
+        if let Some(first_iac) = buf.iter().position(|&x| x == BYTE_IAC) {
+            let block = &buf[..(first_iac+1)];
+            let n = self.writer.write(block)?;
+            if n == block.len() {
+                self.iac = true;
+            }
+            return Ok(n);
+        }
+
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl<W: Write> Writer<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            iac: false,
+        }
+    }
+
+    pub fn negotiate(&mut self, action: NegotiationAction, opt: TelnetOption) -> io::Result<()> {
+        let buf = format_negotiate(action, opt);
+        self.writer.write_all(&buf)
+    }
+    
+    pub fn subnegotiate(&mut self, opt: TelnetOption, data: &[u8]) -> io::Result<()> {
+        let buf = format_subnegotiate(opt, data);
+        self.writer.write_all(&buf)
+    }
+}
+
+/* 
+
+USAGE
+
+let mut stream = TcpStream::connect(("127.0.0.1", 5555))?;
+
+let neg_buf = format_negotiate(NegotiationAction::Will, TelnetOption::TransmitBinary);
+stream.write_all(&neg_buf)?;
+
+let mut buffer = [0u8; 256];
+loop {
+    let n = stream.read(&mut buffer)?;
+    for event in reader.read(&buffer[..n]) {
+        match event {
+            ...
+        }
+    }
+}
+
+*/
 
 #[cfg(test)]
 mod tests {
@@ -601,7 +468,7 @@ mod tests {
         let stream = ZlibStream::from_stream(stream);
         let stream = Box::new(stream);
 
-        let mut telnet = Telnet::from_stream(stream, 6);
+        let mut telnet = Parser::from_stream(stream, 6);
 
         let expected_bytes_1: [u8;2] = [0x40, 0x5a];
         let expected_bytes_2: [u8;3] = [0xff, 0x31, 0x34];
