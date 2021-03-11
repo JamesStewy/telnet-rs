@@ -27,7 +27,6 @@ mod zcstream;
 #[cfg(feature = "zcstream")]
 mod zlibstream;
 
-use io::Result;
 pub use stream::Stream;
 #[cfg(feature = "zcstream")]
 pub use zlibstream::ZlibStream;
@@ -341,53 +340,63 @@ impl<R: Read> Reader<R> {
     }
 }
 
-pub struct Writer<W: Write> {
-    writer: W,
-    iac: bool,
+pub fn write_once<T, F: FnOnce(&[u8]) -> Result<usize, T>>(buf: &[u8], write: F) -> Result<usize, T> {
+    if buf.len() == 0 {
+        return Ok(0);
+    }
+
+    let first_iac = buf.iter().position(|&x| x == BYTE_IAC).unwrap_or(buf.len());
+
+    if first_iac == 0 {
+        write(&[BYTE_IAC, BYTE_IAC]).map(|n| if n == 0 { 0 } else { n-1 })
+    } else {
+        write(&buf[..first_iac])
+    }
 }
+
+/*
+
+// tokio::io::AsyncWrite using write_once
+
+fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    let bytes_written = telnet::write_once(buf, |b| match self.project().0.poll_write(cx, b) {
+        Poll::Ready(Ok(n)) => Ok(n),
+        ret => Err(ret),
+    });
+
+    match bytes_written {
+        Ok(n) => Poll::Ready(Ok(n)),
+        Err(ret) => ret,
+    }
+}
+
+*/
+
+pub struct Writer<W: Write>(W);
 
 impl<W: Write> Write for Writer<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.iac {
-            if self.writer.write(&[BYTE_IAC])? > 0 {
-                self.iac = false;
-            }
-            return Ok(0);
-        }
-
-        if let Some(first_iac) = buf.iter().position(|&x| x == BYTE_IAC) {
-            let block = &buf[..(first_iac+1)];
-            let n = self.writer.write(block)?;
-            if n == block.len() {
-                self.iac = true;
-            }
-            return Ok(n);
-        }
-
-        self.writer.write(buf)
+        write_once(buf, |b| self.0.write(b))
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        self.0.flush()
     }
 }
 
 impl<W: Write> Writer<W> {
     pub fn new(writer: W) -> Self {
-        Self {
-            writer,
-            iac: false,
-        }
+        Self(writer)
     }
 
     pub fn negotiate(&mut self, action: NegotiationAction, opt: TelnetOption) -> io::Result<()> {
         let buf = format_negotiate(action, opt);
-        self.writer.write_all(&buf)
+        self.0.write_all(&buf)
     }
     
     pub fn subnegotiate(&mut self, opt: TelnetOption, data: &[u8]) -> io::Result<()> {
         let buf = format_subnegotiate(opt, data);
-        self.writer.write_all(&buf)
+        self.0.write_all(&buf)
     }
 }
 
